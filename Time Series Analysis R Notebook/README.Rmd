@@ -1,6 +1,6 @@
 ---
 title: "Bitcoin Price Time Series Analysis"
-output: html_notebook
+output: github_document
 ---
 
 ## Overview
