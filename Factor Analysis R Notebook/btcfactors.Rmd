@@ -1,0 +1,463 @@
+---
+title: "Bitcoin Factor Analysis"
+output: html_notebook
+---
+
+## Overview
+
+This project will aim to develop an asset pricing model to explain the returns for bitcoin (BTC). The initial data source will be crypto data from CoinGecko via the geckor package. In addition to the daily price data, the CoinGecko API provides daily market capitalizations and trading volumes, which will be explored as asset pricing factors. Additionally, we'll consider more traditional asset pricing factors, such as the Fama/French factors, which are shown not to explain bitcoin returns. Lastly, we'll consider some technical data from the Bitcoin blockchain, such as network hashrate, and test if those help explain the returns. For a more in-depth analysis on this topic across a wider range of the crypto market, see [Liu, Tsyvinski, and Wu (2022), "Common Risk Factors in Cryptocurrency," *Journal of Finance*, 77(2): 1133-1177.](https://doi.org/10.1111/jofi.13119)
+
+
+## R Packages
+
+* The [devtools package](https://cran.r-project.org/package=devtools) contains the `install_github()` function, which allows us to install packages directly from GitHub. This will let us install the geckor package, which is no longer published to CRAN.
+* The [geckor package](https://github.com/next-game-solutions/geckor) is a wrapper for the [CoinGecko API](https://www.coingecko.com/en/api) and allows for easy import of bitcoin price data.
+* The [dplyr package](https://cran.r-project.org/package=dplyr) contains tools for data transformations.
+* The [xts package](https://cran.r-project.org/package=xts) is short for 'eXtensible Time Series', which contains tools for working with time series data.
+* The [lubridate package](https://cran.r-project.org/package=tseries) contains tools for working with date-math.
+* The [readr package](https://cran.r-project.org/package=readr) is a common package for reading in factor data files. After installing, the RStudio Environment tab will have a new option to import data sets that uses this package. It will even generate the R code for you to copy and paste into your script.
+* The [jsonlite package](https://cran.r-project.org/package=jsonlite) lets us more easily import JSON data.
+* The [ggplot2 package](https://cran.r-project.org/package=ggplot2) for graphics and visuals.
+* The [tseries package](https://cran.r-project.org/package=tseries) contains additional time series analysis functions that we will explore.
+* The [rmarkdown package](https://cran.r-project.org/package=rmarkdown) is used to generate this R Notebook.
+
+```{r setup, results='hide'}
+# Create list of packages needed for this exercise, omit geckor since its not on CRAN
+list.of.packages = c("devtools","dplyr","xts","readr","jsonlite","ggplot2","tseries","rmarkdown")
+# Check if any have not yet been installed
+new.packages = list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+# If any need to be installed, install them
+if(length(new.packages)) install.packages(new.packages)
+# Since geckor is no longer published to CRAN, install via GitHub
+library(devtools)
+devtools::install_github("next-game-solutions/geckor")
+# Load in the remaining packages
+library(geckor)
+library(dplyr)
+library(xts)
+library(lubridate)
+library(readr)
+library(jsonlite)
+library(ggplot2)
+library(tseries)
+```
+
+
+## Data Imports
+
+This section will build out a cleaned dataset for use in the subsequent analysis. To start, we'll import crypto price data from CoinGecko. Then we'll import factor data from Kenneth French's website to see if known equity factors explain bitcoin returns. Next, we'll import some more bitcoin-specific data to make a more tailored asset pricing model.
+
+
+### Crypto Price Data
+
+To start, we'll import bitcoin price data using the geckor R package, which imports data via the [CoinGecko API](https://www.coingecko.com/en/api). Then for some additional points of comparison, we'll also import the price data for ether (ETH; ethereum) and wrapped bitcoin (WBTC). 
+
+```{r pricedata}
+startdate = "2013-04-27"
+coinids = c("bitcoin","ethereum","wrapped-bitcoin")
+prices = coin_history_range(coin_id=coinids,
+                            vs_currency = "usd",
+                            from = as.POSIXct(startdate),
+                            to = as.POSIXct(Sys.Date()))
+```
+
+Interestingly, as of January 2024, the above import code produces a warning of some missing values in the market_cap column. If we more closely examine (use `which()` and `is.na()` to identify the row numbers of the missing values), these missing values appear to be for April 2, 2017. Not sure why exactly this is, but since we have price data on each of those days, we can impute these values without too much difficulty.
+
+```{r fixmissing}
+# Identify indices of missing values
+missinginds = which(is.na(prices$market_cap))
+prices[missinginds,]
+for (i in missinginds){
+  # Subset data to 3-day period from [-1,1]
+  subprice = prices[(i-1):(i+1),]
+  # Create ncoins variable by dividing market cap by price
+  subprice$ncoins = subprice$market_cap/subprice$price
+  # Impute missing value with average of day before and day after
+  subprice$ncoins[2] = (subprice$ncoins[1]+subprice$ncoins[3])/2
+  # Compute missing market cap as price*ncoins
+  subprice$market_cap[2] = subprice$ncoins[2]*subprice$price[2]
+  # Move imputed value back to main data frame
+  prices$market_cap[i] = subprice$market_cap[2]
+}
+sum(is.na(prices)) # Verify no more missing values
+```
+
+#### Crypto Data Cleaning
+
+Since the data format for each coin is similar, we can loop the data cleaning process to simplify the scalability of the code. So if we add more cryptos to analyze, we shouldn't need to change any of this cleaning code below. The comments in the code chunk should help clarify the individual steps, but generally, it isolates the observations for each coin, and then transforms the OHLCV data into an xts object. Since some of the daily factors that we plan to explore only are observed at a business-day frequency (and to focus on longer-term trends), we'll expand out to the monthly frequency with the price data. Then we transform the monthly prices to annualized returns to resolve the autocorrelation of the price series. 
+
+As an alternative measure, we'll measure the annualized growth rate of the market capitalization. With the gradual mining of new BTC into existence, these growth rates will slightly outperform the price appreciation (returns). However, as the halving cycles continue and the upper-bound of 21 million BTC is approached, this gap between these measurements will get smaller. When measuring financial returns, the former (price-driven) return will be more appropriate, and for a more general measurement of the growth in the economic magnitude of Bitcoin, the latter (market-cap-driven) return will be more appropriate.
+
+Lastly, since the OHLCV data includes daily trading volumes (which converted to monthly totals), we'll consider this a potential factor in our analysis. In regard to interpretability, an elasticity interpretation (percent change in volume leads to a beta percent change in price) seems most appropriate here, so we'll transform the monthly trading volume into an annualized growth rate to explore as a factor.
+
+```{r cleanloop}
+dfs_month = list()
+
+#coin = coinids[1] # This line is used for troubleshooting the code inside the for loop below
+### To troubleshoot, uncomment the line above, and then comment out the for and } lines.
+for (coin in coinids) {
+  # Extract price data for each coin
+  subdf = filter(prices, coin_id==coin)
+  # Create xts object for each frequency
+  dailyxts = xts(subdf[,4:6], order.by=as.Date(subdf$timestamp))
+  monthxts = to.monthly(dailyxts)
+  # Calculate annualized return of the coin's price movements
+  monthxts$logprice = log(monthxts$dailyxts.Close)
+  monthxts$annret = (monthxts$logprice - lag(monthxts$logprice))*12*100
+  #monthxts$annret = (log(as.numeric(monthxts$dailyxts.Close)) - log(as.numeric(lag(monthxts$dailyxts.Close))))*12*100
+  # Calculate alternative annualized return measurement from the market cap of the coin
+  # Since to.monthly only converts OHLCV data by default, we must run again for market caps.
+  monthxts2 = to.monthly(dailyxts$market_cap)
+  monthxts$annret2 = (log(as.numeric(monthxts2$`dailyxts$market_cap.Close`)) - log(as.numeric(lag(monthxts2$`dailyxts$market_cap.Close`))))*12*100
+  # Calculate volume growth rates
+  monthxts$logvolume = log(monthxts$dailyxts.Volume)
+  monthxts$volgrowth = (monthxts$logvolume - lag(monthxts$logvolume))*12*100
+  # Calculate within-month volatility of annualized daily returns
+  dailyxts$logprice = log(dailyxts$price)
+  dailyxts$annret = (dailyxts$logprice - lag(dailyxts$logprice))*365*100
+  monthxts3 = apply.monthly(dailyxts$annret, FUN=sd)
+    # Fix dates from end of month to beginning of month like rest of data
+    index(monthxts3) = ceiling_date(index(monthxts3), unit="month") - months(1)
+  monthxts$dailyannretsd = monthxts3
+  # Calculate within-month volatility in annualized volume growth rates
+  dailyxts$logvolume = log(dailyxts$total_volume)
+  dailyxts$volgrowth = (dailyxts$logvolume - lag(dailyxts$logvolume))*365*100
+  monthxts4 = apply.monthly(dailyxts$volgrowth, FUN=sd)
+    # Fix dates from end of month to beginning of month like rest of data
+    index(monthxts4) = ceiling_date(index(monthxts4), unit="month") - months(1)
+  monthxts$dailyannvolsd = monthxts4
+  # Save data frames to output object
+  dfs_month[[coin]] = monthxts
+}
+```
+
+
+### Fama/French Factors
+
+Another set of factors to consider are the Fama/French Factors. The earlier [Fama and French (1993)](https://doi.org/10.1016/0304-405X(93)90023-5) paper introduced a three-factor model that includes SMB (Small Minus Big) as a 'size' factor and HML (High Minus Low) as a 'value'/'growth' factor. See [the 3-Factors webpage](https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/f-f_factors.html) for more detail. The data is also available there at the url in the data chunk below. Since these are available as compressed folders, we must first download the file (we'll put it in a sub-folder, Factor Data) and then decompress (unzip) the file before reading in the data. Then the last few steps clean up the data, format to xts, and delete the pre-Bitcoin data.
+
+```{r ff3download}
+ff3url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+# Create subdirectory for file downloads
+subdirectory = "Factor Data"
+dir.create(subdirectory, showWarnings=FALSE)
+# Define the file paths
+zip_filepath = file.path(subdirectory, "FF3-factors.zip")
+csv_filepath = file.path(subdirectory, "FF3-factors.csv")
+# Download the zip file
+download.file(ff3url, destfile=zip_filepath)
+# Extract the CSV file from the zip file
+unzip(zip_filepath, exdir=subdirectory)
+# The file name in the line below comes from the name of the file within the zipped file
+file.rename("Factor Data/F-F_Research_Data_Factors.CSV", csv_filepath)
+FF3 = read_csv(csv_filepath,
+               col_types = cols(...1 = col_date(format = "%Y%m")), 
+               skip = 2)
+```
+
+The code chunk above reports a warning about some parsing errors. So let's investigate with `problems()`.
+
+```{r ffprobs}
+problems(FF3)
+```
+
+Note how it refers us to the bottom of the data frame. These are the annual observations that are included below the monthly data. Since those annual dates do not import and are missing, we can use `complete.cases()` to easily identify the appropriate columns to retain. Then the date variable imports with an unusual name of `...1`, so we'll fix that, and then reformat to an xts object. Lastly, we use the `paste()` function to generate a string of `"2013-04-27/"`. This type of indexing is part of the xts package, and the `/` separates a start date from an end date. 
+
+```{r ff3cleaning}
+# Trim annual observations from bottom of date frame (dates import as missing)
+FF3 = FF3[complete.cases(FF3),]
+# Fix date variable name
+FF3 = FF3 |> rename(Date=...1)
+# Reformat to xts object
+FF3xts = xts(FF3[,-1], order.by=FF3$Date)
+# Remove data prior to first BTC observation
+FF3xts = FF3xts[paste(startdate,"/",sep="")]
+# Annualize factor data to match annualized return scaling
+FF3xts = FF3xts*12
+```
+
+More recently, [Fama and French (2015)](https://doi.org/10.1016/j.jfineco.2014.10.010) includes two additional factors: RMW (Robust Minus Weak) as a 'profitability' factor and CMA (Conservative Minus Aggressive) factor. The [5-Factors webpage](https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/f-f_5_factors_2x3.html) has more detail.
+
+```{r ff5}
+ff5url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
+# Define the file paths
+zip_filepath = file.path(subdirectory, "FF5-factors.zip")
+csv_filepath = file.path(subdirectory, "FF5-factors.csv")
+# Download the zip file
+download.file(ff5url, destfile=zip_filepath)
+# Extract the CSV file from the zip file
+unzip(zip_filepath, exdir=subdirectory)
+file.rename("Factor Data/F-F_Research_Data_5_Factors_2x3.CSV", csv_filepath)
+FF5 = read_csv(csv_filepath,
+               col_types = cols(...1 = col_date(format = "%Y%m")), 
+               skip = 2)
+# Trim annual observations from bottom of date frame (dates import as missing)
+FF5 = FF5[complete.cases(FF5),]
+# Fix date variable name
+FF5 = FF5 |> rename(Date=...1)
+# Reformat numbers to numeric type and annualize
+FF5$`Mkt-RF` = as.numeric(FF5$`Mkt-RF`)*12
+FF5$SMB = as.numeric(FF5$SMB)*12
+FF5$HML = as.numeric(FF5$HML)*12
+FF5$RMW = as.numeric(FF5$RMW)*12
+FF5$CMA = as.numeric(FF5$CMA)*12
+FF5$RF = as.numeric(FF5$RF)*12
+# Reformat to xts object
+FF5xts = xts(FF5[,-1], order.by=FF5$Date)
+# Remove data prior to first BTC observation
+FF5xts = FF5xts[paste(startdate,"/",sep="")]
+```
+
+
+
+## Factor Model Regressions
+
+### Trading Volume Growth as a Factor
+
+Let's start with just the crypto data and explore the idea of using growth in trading volume as a factor to explain crypto returns. This will also provide some structure to the following sets of regressions in regard to aggregating data across the various xts objects and running the regressions. 
+
+```{r volregs}
+# Select relevant variables and merge into a single xts object
+assets_volregs = merge(dfs_month$bitcoin$annret,
+                       dfs_month$bitcoin$annret2,
+                       dfs_month$bitcoin$volgrowth,
+                       dfs_month$ethereum$annret,
+                       dfs_month$ethereum$annret2,
+                       dfs_month$ethereum$volgrowth,
+                       dfs_month$`wrapped-bitcoin`$annret,
+                       dfs_month$`wrapped-bitcoin`$annret2,
+                       dfs_month$`wrapped-bitcoin`$volgrowth)
+# Give unique variable names
+colnames(assets_volregs) = c("BTC_PriceRet", "BTC_MktCapRet", "BTC_VolGrowth",
+                         "ETH_PriceRet", "ETH_MktCapRet", "ETH_VolGrowth",
+                         "WBTC_PriceRet", "WBTC_MktCapRet", "WBTC_VolGrowth")
+# Bitcoin Regressions
+volregBTC1 = lm(BTC_PriceRet~BTC_VolGrowth, data=assets_volregs[is.finite(assets_volregs$BTC_VolGrowth)])
+summary(volregBTC1)
+volregBTC2 = lm(BTC_MktCapRet~BTC_VolGrowth, data=assets_volregs[is.finite(assets_volregs$BTC_VolGrowth)])
+summary(volregBTC2)
+# Ethereum Regressions
+volregETH1 = lm(ETH_PriceRet~ETH_VolGrowth, data=assets_volregs[is.finite(assets_volregs$ETH_VolGrowth)])
+summary(volregETH1)
+volregETH2 = lm(ETH_MktCapRet~ETH_VolGrowth, data=assets_volregs[is.finite(assets_volregs$ETH_VolGrowth)])
+summary(volregETH2)
+# Wrapped Bitcoin Regressions
+volregWBTC1 = lm(WBTC_PriceRet~WBTC_VolGrowth, data=assets_volregs[is.finite(assets_volregs$WBTC_VolGrowth)])
+summary(volregWBTC1)
+volregWBTC2 = lm(WBTC_MktCapRet~WBTC_VolGrowth, data=assets_volregs[is.finite(assets_volregs$WBTC_MktCapRet)])
+summary(volregWBTC2)
+```
+
+
+### Fama/French 3-Factor Models
+
+Next we can apply some more traditional asset pricing models from the finance literature. With the FF3-Factor data, we'll do several comparisons. For each crypto, we'll (1) first run a CAPM regression on the full time series using only the market risk premium factor. Then (2) uses all three factors. Lastly, (3) and (4) are the same as (1) and (2), but using only the 60 most recent months of data to compare the relatinship in more recent periods to the longer-term analysis.
+
+```{r ff3regs}
+# Compile data frame of annualized crypto returns
+assets_ff3 = merge(dfs_month$bitcoin$annret,
+                   dfs_month$ethereum$annret,
+                   dfs_month$`wrapped-bitcoin`$annret)
+# Correct variable names
+colnames(assets_ff3) = c("BTC", "ETH", "WBTC")
+# Merge to FF3 data
+assets_ff3 = merge(assets_ff3[-1,], FF3xts)
+# Calculate excess returns for cryptos
+assets_ff3$BTCxs = assets_ff3$BTC - assets_ff3$RF
+assets_ff3$ETHxs = assets_ff3$ETH - assets_ff3$RF
+assets_ff3$WBTCxs = assets_ff3$WBTC - assets_ff3$RF
+# Bitcoin FF3 regressions
+FF1reg_BTC_ALL = lm(BTCxs~Mkt.RF, data=assets_ff3)
+summary(FF1reg_BTC_ALL)
+FF3reg_BTC_ALL = lm(BTCxs~Mkt.RF+SMB+HML, data=assets_ff3)
+summary(FF3reg_BTC_ALL)
+FF1reg_BTC_5yr = lm(BTCxs~Mkt.RF, data=tail(assets_ff3,60))
+summary(FF1reg_BTC_5yr)
+FF3reg_BTC_5yr = lm(BTCxs~Mkt.RF+SMB+HML, data=tail(assets_ff3,60))
+summary(FF3reg_BTC_5yr)
+# Ethereum FF3 Regressions
+FF1reg_ETH_ALL = lm(ETHxs~Mkt.RF, data=assets_ff3)
+summary(FF1reg_ETH_ALL)
+FF3reg_ETH_ALL = lm(ETHxs~Mkt.RF+SMB+HML, data=assets_ff3)
+summary(FF3reg_ETH_ALL)
+FF1reg_ETH_5yr = lm(ETHxs~Mkt.RF, data=tail(assets_ff3,60))
+summary(FF1reg_ETH_5yr)
+FF3reg_ETH_5yr = lm(ETHxs~Mkt.RF+SMB+HML, data=tail(assets_ff3,60))
+summary(FF3reg_ETH_5yr)
+# Wrapped Bitcoin FF3 Regressions
+FF1reg_WBTC_ALL = lm(WBTCxs~Mkt.RF, data=assets_ff3)
+summary(FF1reg_WBTC_ALL)
+FF3reg_WBTC_ALL = lm(WBTCxs~Mkt.RF+SMB+HML, data=assets_ff3)
+summary(FF3reg_WBTC_ALL)
+# # Since WBTC is still <5 years old, no need to do these yet.
+# FF1reg_WBTC_5yr = lm(WBTCxs~Mkt.RF, data=tail(assets_ff3,60))
+# summary(FF1reg_WBTC_5yr)
+# FF3reg_WBTC_5yr = lm(WBTCxs~Mkt.RF+SMB+HML, data=tail(assets_ff3,60))
+# summary(FF3reg_WBTC_5yr)
+```
+
+
+### Fama/French 5-Factor Models
+
+Lastly, we'll run the regressions with all 5 Fama/French Factors.
+
+```{r ff5regs}
+# Compile data frame of annualized crypto returns
+assets_ff5 = merge(dfs_month$bitcoin$annret,
+                   dfs_month$ethereum$annret,
+                   dfs_month$`wrapped-bitcoin`$annret)
+# Correct variable names
+colnames(assets_ff5) = c("BTC", "ETH", "WBTC")
+# Merge to FF5 data
+assets_ff5 = merge(assets_ff5[-1,], FF5xts)
+# Calculate excess returns for cryptos
+assets_ff5$BTCxs = assets_ff5$BTC - assets_ff5$RF
+assets_ff5$ETHxs = assets_ff5$ETH - assets_ff5$RF
+assets_ff5$WBTCxs = assets_ff5$WBTC - assets_ff5$RF
+# Bitcoin FF5 regressions
+FF5reg_BTC_ALL = lm(BTCxs~Mkt.RF+SMB+HML+RMW+CMA, data=assets_ff5)
+summary(FF5reg_BTC_ALL)
+FF5reg_BTC_5yr = lm(BTCxs~Mkt.RF+SMB+HML+RMW+CMA, data=tail(assets_ff5,60))
+summary(FF5reg_BTC_5yr)
+# Ethereum FF5 Regressions
+FF5reg_ETH_ALL = lm(ETHxs~Mkt.RF+SMB+HML+RMW+CMA, data=assets_ff5)
+summary(FF5reg_ETH_ALL)
+FF5reg_ETH_5yr = lm(ETHxs~Mkt.RF+SMB+HML+RMW+CMA, data=tail(assets_ff5,60))
+summary(FF5reg_ETH_5yr)
+# Wrapped Bitcoin FF3 Regressions
+FF5reg_WBTC_ALL = lm(WBTCxs~Mkt.RF+SMB+HML+RMW+CMA, data=assets_ff5)
+summary(FF5reg_WBTC_ALL)
+# # Since WBTC is still <5 years old, no need to do this yet.
+# FF5reg_WBTC_5yr = lm(WBTCxs~Mkt.RF+SMB+HML+RMW+CMA, data=tail(assets_ff5,60))
+# summary(FF5reg_WBTC_5yr)
+```
+
+
+### Other Bitcoin-Related Factors
+
+#### Bitcoin Mining Hashrate as a Factor
+
+```{r hashratedata}
+# Build endpoint url for hashrates
+mempoolbase = "https://mempool.space/api/v1/"
+hashrateendpt = "mining/hashrate/pools/"
+hashrateurl = paste(mempoolbase, hashrateendpt, sep="")
+# Make API call and read JSON response
+hashrateresponse = fromJSON(hashrateurl)
+```
+
+API response has two data tables: hashrates has total hashrates at daily frequency and the difficulty table is at a frequency that is roughly every other week. However, since the epoch length in Bitcoin is defined by 2016 blocks, rather than two weeks, there is some short-term variation in the timing. We shall see how well the `as.monthly()` function handles this conversion. 
+
+```{r hashratecleaning1}
+# Extract hashrate table and difficulty table
+hashratedf = hashrateresponse$hashrates
+difficultydf = hashrateresponse$difficulty
+# Reformat dates from unix time to R date
+hashratedf$date = hashratedf$timestamp |> as.POSIXct() |> as.Date()
+difficultydf$date = difficultydf$time |> as.POSIXct() |> as.Date()
+```
+
+```{r hashratecleaning2}
+hashratexts_daily = xts(hashratedf[,1:2], order.by=hashratedf$date)
+hashratexts = to.monthly(hashratexts_daily$avgHashrate)
+# Correct variable names
+colnames(hashratexts) = c("BTChashrate_Open", "BTChashrate_High", "BTChashrate_Low", "BTChashrate_Close")
+# 
+hashratexts$BTChashrate_Mid = (hashratexts$BTChashrate_Open+hashratexts$BTChashrate_Close)/2
+```
+
+```{r pricevshashrate}
+ggplot(dfs_month$bitcoin,aes(x=Index, y=dailyxts.Close)) +
+  geom_line() +
+  xlab("") +
+  ggtitle("Monthly BTC Price Series (April 2013 - Present)")
+ggplot(hashratexts,aes(x=Index, y=BTChashrate_Close)) +
+  geom_line() +
+  xlab("") +
+  ggtitle("Monthly BTC Hashrate Series (January 2009 - Present)")
+```
+
+```{r hashgrowth}
+# Calculate annualized growth rate of each hashrate measurement
+hashratexts$loghash_High = log(hashratexts$BTChashrate_High)
+hashratexts$BTChashgrowth_High = (hashratexts$loghash_High - lag(hashratexts$loghash_High))*12*100
+hashratexts$loghash_Low = log(hashratexts$BTChashrate_Low)
+hashratexts$BTChashgrowth_Low = (hashratexts$loghash_Low - lag(hashratexts$loghash_Low))*12*100
+hashratexts$loghash_Close = log(hashratexts$BTChashrate_Close)
+hashratexts$BTChashgrowth_Close = (hashratexts$loghash_Close - lag(hashratexts$loghash_Close))*12*100
+hashratexts$loghash_Mid = log(hashratexts$BTChashrate_Mid)
+hashratexts$BTChashgrowth_Mid = (hashratexts$loghash_Mid - lag(hashratexts$loghash_Mid))*12*100
+```
+
+```{r hashregs}
+# Compile data frame of annualized crypto returns
+assets_hash = merge(dfs_month$bitcoin$annret,
+                   dfs_month$ethereum$annret,
+                   dfs_month$`wrapped-bitcoin`$annret,
+                   dfs_month$bitcoin$volgrowth,
+                   dfs_month$ethereum$volgrowth,
+                   dfs_month$`wrapped-bitcoin`$volgrowth)
+# Correct variable names
+colnames(assets_hash) = c("BTC", "ETH", "WBTC", "BTCvolgrowth", "ETHvolgrowth", "WBTCvolgrowth")
+# Merge to hashrate data
+assets_hash = merge(assets_hash[-1,], hashratexts)
+# Bitcoin hashrate regressions (High, no lag)
+hashreg_BTC_High_ALL = lm(BTC~BTChashgrowth_High, data=assets_hash)
+summary(hashreg_BTC_High_ALL)
+hashreg_BTC_High_5yr = lm(BTC~BTChashgrowth_High, data=tail(assets_hash,60))
+summary(hashreg_BTC_High_5yr)
+# Bitcoin hashrate regressions (High, 1mo lag)
+hashreg_BTC_High_ALL_lag = lm(BTC~lag(BTChashgrowth_High), data=assets_hash)
+summary(hashreg_BTC_High_ALL_lag)
+hashreg_BTC_High_5yr_lag = lm(BTC~lag(BTChashgrowth_High), data=tail(assets_hash,60))
+summary(hashreg_BTC_High_5yr_lag)
+# Bitcoin hashrate regressions (Close, no lag)
+hashreg_BTC_Close_ALL = lm(BTC~BTChashgrowth_Close, data=assets_hash)
+summary(hashreg_BTC_Close_ALL)
+hashreg_BTC_Close_5yr = lm(BTC~BTChashgrowth_Close, data=tail(assets_hash,60))
+summary(hashreg_BTC_Close_5yr)
+# Bitcoin hashrate regressions (Close, 1mo lag)
+hashreg_BTC_Close_ALL_lag = lm(BTC~lag(BTChashgrowth_Close), data=assets_hash)
+summary(hashreg_BTC_Close_ALL_lag)
+hashreg_BTC_Close_5yr_lag = lm(BTC~lag(BTChashgrowth_Close), data=tail(assets_hash,60))
+summary(hashreg_BTC_Close_5yr_lag)
+# Combine best hashrate measure with volume growth for two-factor model
+hashreg_BTC_opt = lm(BTC~BTCvolgrowth+lag(BTChashgrowth_Close), data=assets_hash[is.finite(assets_hash$BTCvolgrowth)])
+summary(hashreg_BTC_opt)
+```
+```{r hashcors}
+cor(assets_hash[is.finite(assets_hash$BTCvolgrowth)], use="pairwise.complete.obs") |> round(2)
+```
+
+```{r hashautocorr1}
+acf(hashratexts$BTChashrate_High)
+acf(hashratexts$BTChashrate_Low)
+acf(hashratexts$BTChashrate_Close)
+acf(hashratexts$BTChashrate_Mid)
+pacf(hashratexts$BTChashrate_High)
+pacf(hashratexts$BTChashrate_Low)
+pacf(hashratexts$BTChashrate_Close)
+pacf(hashratexts$BTChashrate_Mid)
+#
+adf.test(hashratexts$BTChashrate_High)
+adf.test(hashratexts$BTChashrate_Low)
+adf.test(hashratexts$BTChashrate_Close)
+adf.test(hashratexts$BTChashrate_Mid)
+```
+
+```{r hashautocorr2}
+acf(hashratexts$BTChashgrowth_High[is.finite(hashratexts$BTChashgrowth_High)])
+acf(hashratexts$BTChashgrowth_Low[is.finite(hashratexts$BTChashgrowth_Low)])
+acf(hashratexts$BTChashgrowth_Close[is.finite(hashratexts$BTChashgrowth_Close)])
+acf(hashratexts$BTChashgrowth_Mid[is.finite(hashratexts$BTChashgrowth_Mid)])
+pacf(hashratexts$BTChashgrowth_High[is.finite(hashratexts$BTChashgrowth_High)])
+pacf(hashratexts$BTChashgrowth_Low[is.finite(hashratexts$BTChashgrowth_Low)])
+pacf(hashratexts$BTChashgrowth_Close[is.finite(hashratexts$BTChashgrowth_Close)])
+pacf(hashratexts$BTChashgrowth_Mid[is.finite(hashratexts$BTChashgrowth_Mid)])
+#
+adf.test(hashratexts$BTChashgrowth_High[is.finite(hashratexts$BTChashgrowth_High)])
+adf.test(hashratexts$BTChashgrowth_Low[is.finite(hashratexts$BTChashgrowth_Low)])
+adf.test(hashratexts$BTChashgrowth_Close[is.finite(hashratexts$BTChashgrowth_Close)])
+adf.test(hashratexts$BTChashgrowth_Mid[is.finite(hashratexts$BTChashgrowth_Mid)])
+```
+
