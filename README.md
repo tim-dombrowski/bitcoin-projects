@@ -2,7 +2,7 @@
 
 ### Overview
 
-This repository contains a collection of data projects related to the bitcoin price series. The Time Series Analysis project focuses on exploring the time series properties of the bitcoin price series and modeling the seasonality and trend components.
+This repository contains a collection of data projects related to the bitcoin price series. The Time Series Analysis project focuses on exploring the time series properties of the bitcoin price series and modeling the seasonality and trend components. Then the Factor Analysis project explores the relationship between the bitcoin price series within the context of some traditional asset pricing models, such as the Fama-French 3-Factor Model and the Fama-French 5-factor model. Each of the R Notebooks contains a more detailed overview before the data work begins.
 
 ### Repository Structure
 
